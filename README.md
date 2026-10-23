@@ -29,7 +29,7 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | `01-setup` | Creates the `pakistan_weather` database and the `pipeline_execution_logs` table. |
 | `02-bronzelayer` | Raw JSON → Bronze. Reads with an explicit `StructType` (no `inferSchema`). |
 | `03-silverlayer` | Bronze → Silver. Explodes hourly arrays, casts types, quarantines bad rows, `MERGE INTO`. |
-| `04-incrementalload` | Fetches one day from the API, saves the raw file, then runs `02` and `03`. |
+| `04-incrementalload` | Fetches one day or a date range from the API, saves the raw file, then runs `02` and `03`. |
 
 ## 3. Data Dictionary
 
@@ -136,7 +136,7 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 
 ## 5. Execution Guide
 
-Run `01-setup` once before anything else.
+Run `00-dataaquisition_fullload and 01-setup` once before anything else.
 
 ### 5.1 Initial full load (one time)
 
@@ -150,7 +150,7 @@ Run `01-setup` once before anything else.
 
 ### 5.2 Standard incremental load (daily)
 
-Run `04-incrementalload` with no changes. `target_date` defaults to yesterday. The notebook:
+Run `04-incrementalload` with no changes. date defaults to yesterday. The notebook:
 1. Fetches that date for all 5 cities and saves `incremental_<date>.json`
 2. Runs `02-bronzelayer` (append, `batch_id = batch_incremental_<date>`)
 3. Runs `03-silverlayer` (`MERGE` into Silver)
@@ -159,8 +159,8 @@ Run `04-incrementalload` with no changes. `target_date` defaults to yesterday. T
 
 | Goal | What to run | Parameters |
 |---|---|---|
-| Re-load one historical day end to end | `04-incrementalload` | `target_date` = `YYYY-MM-DD` |
-| Re-load a range of days | `04-incrementalload` once per date | `target_date` = each date in the range |
+| Re-load one historical day end to end | `04-incrementalload` | start_date = end_date = YYYY-MM-DD for one day |
+| Re-load a range of days | `04-incrementalload` once per date | start_date = first day, end_date = last day (inclusive) |
 | Raw → Bronze only, for any raw file | `02-bronzelayer` | `load_type` = `incremental`, `batch_id`, `raw_file` |
 | Bronze → Silver only, for any existing batch | `03-silverlayer` | `load_type`, `batch_id` of the batch to rebuild |
 
