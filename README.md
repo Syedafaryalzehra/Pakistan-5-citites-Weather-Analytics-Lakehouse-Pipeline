@@ -303,3 +303,32 @@ Run `05-goldlayer` with `load_type` = `full`, `batch_id` = `batch_fullload_2000_
 
 ### 5.6 Gold on the daily incremental
 No extra step: `04-incrementalload` now sets `LOAD_TYPE = "incremental"` and runs Gold automatically after Silver, MERGE-ing only that day's batch into the fact and rebuilding aggregates.
+
+## 6. Repository Structure
+
+```
+Phase3/
+├── Final Architecture & FinOps Report pakistan weather.pdf
+└── Pakistan_5cities_weather_pipeline_visualreport.pbix
+
+data/
+├── fetch_data.py
+├── Full_load/full_load_sample.json
+└── incremental_load/inc_load.json
+
+phase-1/ (proposal documents)
+
+phase2/
+└── notebooks/
+    ├── 00-dataacqusition_fullload.ipynb
+    ├── 01-setup.ipynb
+    ├── 02-bronzelayer.ipynb
+    ├── 03-silverlayer.ipynb
+    ├── 04-incrementalload.ipynb
+    └── 05-goldlayer.ipynb
+
+README.md
+```
+
+
+
