@@ -306,3 +306,138 @@ phase2/
 
 README.md
 ```
+%md
+# Phase 3 — Gold Layer
+
+Builds the **Gold** star schema on top of Silver: two shared dimensions, one clustered hourly fact, and two aggregate rollups, plus automated data-quality validation after every load.
+
+## 1. Architecture (updated)
+
+```
+Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze ──► Silver ──► Gold (star schema)
+                                                        │            │
+                                                        │     ┌──────┴──────┐
+                                                        │   dim_location dim_date
+                                                        │        │       │
+                                                        └── fact_weather_hourly (CLUSTER BY location_key, date_key)
+                                                                  │
+                                                   agg_monthly_climate · agg_yearly_extremes
+                                                        │
+                                              pipeline_execution_logs (audit)
+```
+
+| Layer | Table | Behaviour |
+|---|---|---|
+| Dim | `dim_location` | 5 rows (one per city). Rebuilt with `overwriteSchema` every Gold run. |
+| Dim | `dim_date` | One row per day, 2000-01-01 → max year in Silver, with calendar hierarchy + `season`, `is_weekend`, `is_monsoon`. |
+| Fact | `fact_weather_hourly` | One row per city per hour. Loaded with `MERGE INTO`, **liquid clustered** by `(location_key, date_key)`. |
+| Agg | `agg_monthly_climate` | Monthly rollup per city (avg/min/max temp, total precip, avg wind, hours observed). Rebuilt full-table each run. |
+| Agg | `agg_yearly_extremes` | Yearly extremes per city (hottest, coldest, wettest day, highest wind). Rebuilt full-table each run. |
+
+## 2. Notebooks (added)
+
+| Notebook | Purpose |
+|---|---|
+| `05-goldlayer` | Silver → Gold. Builds `dim_location` (nearest-city grid mapping), `dim_date` (dynamic through max Silver year), `fact_weather_hourly` (MERGE + derived `time_of_day` / `heat_index`), both aggregates, `OPTIMIZE` (full loads only), validation checks, and the `Silver-to-Gold` audit row. |
+
+## 3. Data Dictionary (Gold)
+
+### 3.5 `dim_location` — 5 rows
+**Primary key:** `location_key`.
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | Surrogate key, 1–5 |
+| `city` | STRING | Lahore, Karachi, Islamabad, Peshawar, Quetta |
+| `province` | STRING | Province / territory |
+| `grid_latitude`, `grid_longitude` | DOUBLE | API grid point (joins back to Silver lat/long) |
+| `city_latitude`, `city_longitude` | DOUBLE | City centre coordinates |
+
+### 3.6 `dim_date` — one row per day, 2000 → latest loaded year
+**Primary key:** `date_key` (smart key `YYYYMMDD`).
+
+| Column | Type | Description |
+|---|---|---|
+| `date_key` | INT | `YYYYMMDD` |
+| `full_date` | DATE | Calendar date |
+| `year`, `quarter`, `month`, `day`, `day_of_week` | INT | Calendar hierarchy |
+| `month_name`, `day_name` | STRING | Human-readable |
+| `is_weekend` | BOOLEAN | Sat/Sun |
+| `season` | STRING | Spring / Summer / Autumn / Winter |
+| `is_monsoon` | BOOLEAN | Jul–Sep |
+
+### 3.7 `fact_weather_hourly` — one row per city per hour
+**Grain:** city + hour. **Primary key:** `(location_key, observation_timestamp)` — this is the `MERGE` key.
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | FK → `dim_location` |
+| `date_key` | INT | FK → `dim_date` |
+| `observation_timestamp` | TIMESTAMP | Hour of observation |
+| `hour` | INT | 0–23 |
+| `time_of_day` | STRING | Derived: Morning / Afternoon / Evening / Night |
+| `heat_index` | DOUBLE | Derived: NOAA-style approximation, only for temps ≥ 27 °C, else equals `temperature_2m` |
+| `gold_load_timestamp` | TIMESTAMP | Load time |
+| `batch_id` | STRING | Batch identifier |
+
+**Measures:** `temperature_2m`, `apparent_temperature`, `relative_humidity_2m`, `precipitation`, `rain`, `wind_speed_10m`, `wind_gusts_10m`, `pressure_msl`, `cloud_cover`, `shortwave_radiation`, `et0_fao_evapotranspiration`.
+
+### 3.8 `agg_monthly_climate` / `agg_yearly_extremes`
+
+**Monthly** — logical key `(location_key, year, month)`; `date_key` points to the month-start date (`YYYYMM01`) in `dim_date` (shared dimension at coarser grain). Columns: `avg_temp_c`, `min_temp_c`, `max_temp_c`, `total_precip_mm`, `avg_wind_speed_kmh`, `hours_observed` (~744/city/month), `gold_load_timestamp`, `batch_id`.
+
+**Yearly** — logical key `(location_key, year)`; `date_key` points to the year-start date (`YYYY0101`). Columns: `hottest_temp_c`, `coldest_temp_c`, `wettest_day_precip_mm`, `highest_wind_speed_kmh`, `gold_load_timestamp`, `batch_id`.
+
+### 3.4 Audit table update
+`pipeline_execution_logs` now also receives `Silver-to-Gold` runs (`rows_inserted` / `rows_updated` from the fact MERGE metrics, `rows_aggregated` = fact rows processed).
+
+## 4. Engineering Design (added)
+
+**Star schema.** The fact joins Silver's grid coordinates to the nearest city (squared-distance window), then both dimensions are broadcast-joined — dimensions are tiny (5 and ~9.8 K rows), so broadcast avoids shuffling the 1.17 M-row fact.
+
+**Liquid clustering, not partitioning.** `fact_weather_hourly` uses `CLUSTER BY (location_key, date_key)` because every analytical query filters by city and date. Unlike Hive-style partitioning, it adapts as data grows and avoids small-file and over-partitioning problems.
+
+**Idempotency.** The fact is loaded with `MERGE INTO` on `(location_key, observation_timestamp)` — re-running any batch updates in place, never duplicates. Dimensions and aggregates are rebuilt with `overwrite`, which is safe because they are fully derived from the fact.
+
+**Cost control (FinOps).** `OPTIMIZE` runs only on full loads; daily incremental runs skip compaction and stay cheap.
+
+**Derived measures.** `time_of_day` buckets and the `heat_index` formula (applied at ≥ 27 °C) are computed once in Gold, so every consumer gets identical definitions.
+
+**Automated validation.** After every Gold run: row counts per table, exactly 5 locations expected, zero duplicate fact keys, zero orphan `location_key` / `date_key` values (referential integrity), enforced with assertions that fail the run on violation.
+
+## 5. Execution Guide (added)
+
+### 5.5 Gold after a full Silver load
+Run `05-goldlayer` with `load_type` = `full`, `batch_id` = `batch_fullload_2000_2026`.
+
+### 5.6 Gold on the daily incremental
+No extra step: `04-incrementalload` now sets `LOAD_TYPE = "incremental"` and runs Gold automatically after Silver, MERGE-ing only that day's batch into the fact and rebuilding aggregates.
+
+## 6. Repository Structure
+
+```
+Phase3/
+├── Final Architecture & FinOps Report pakistan weather.pdf
+└── Pakistan_5cities_weather_pipeline_visualreport.pbix
+
+data/
+├── fetch_data.py
+├── Full_load/full_load_sample.json
+└── incremental_load/inc_load.json
+
+phase-1/ (proposal documents)
+
+phase2/
+└── notebooks/
+    ├── 00-dataacqusition_fullload.ipynb
+    ├── 01-setup.ipynb
+    ├── 02-bronzelayer.ipynb
+    ├── 03-silverlayer.ipynb
+    ├── 04-incrementalload.ipynb
+    └── 05-goldlayer.ipynb
+
+README.md
+```
+
+
+
