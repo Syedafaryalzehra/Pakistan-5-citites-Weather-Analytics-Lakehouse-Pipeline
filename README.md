@@ -1,6 +1,6 @@
-# Pakistan 5-Cities Weather Analytics — Lakehouse Pipeline (Phase 2)
+# Pakistan 5-Cities Weather Analytics — Lakehouse Pipeline (Phases 1–3)
 
-PySpark pipeline on Databricks implementing the **Bronze** and **Silver** layers of a medallion architecture.
+PySpark pipeline on Databricks implementing the **Bronze**, **Silver** and **Gold** layers of a medallion architecture, served to Power BI.
 
 - **Source:** Open-Meteo Historical Weather API (hourly data)
 - **Cities:** Lahore, Karachi, Islamabad, Peshawar, Quetta
@@ -10,9 +10,17 @@ PySpark pipeline on Databricks implementing the **Bronze** and **Silver** layers
 
 ```
 Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) ──► Silver (typed, deduplicated)
-                                              │                              │
-                                              └────── pipeline_execution_logs ◄──┘
-                                                                        silver_quarantine (rejected rows)
+                                              │                              │        │
+                                              │                     silver_quarantine  │
+                                              │                              │        │
+                                              └── pipeline_execution_logs ◄──┴────────┤
+                                                                                     │
+                                                     Gold star schema  ◄─────────────┘
+                                                     dim_location · dim_date
+                                                     fact_weather_hourly (clustered)
+                                                     agg_monthly_climate · agg_yearly_extremes
+                                                                                     │
+                                                                          Power BI (Phase3/*.pbix)
 ```
 
 | Layer | Table | Behaviour |
@@ -20,7 +28,11 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | Bronze | `bronze_weather_raw` | Raw landing zone. Explicit schema, every value kept as a string. Full load = overwrite (one time), incremental = append. |
 | Silver | `silver_weather_cleaned` | One row per city per hour. Types cast, derived columns added, loaded with `MERGE INTO`. |
 | Quarantine | `silver_quarantine` | Rows that could not be cast to the expected types. |
-| Audit | `pipeline_execution_logs` | One row per layer run. |
+| Gold — Dim | `dim_location`, `dim_date` | Conformed dimensions: 5 cities; calendar 2000 → latest loaded year. Rebuilt with `overwriteSchema`. |
+| Gold — Fact | `fact_weather_hourly` | One row per city per hour. `MERGE INTO` + liquid clustering on `(location_key, date_key)`. |
+| Gold — Agg | `agg_monthly_climate`, `agg_yearly_extremes` | Monthly and yearly rollups rebuilt from the fact each run. |
+| Audit | `pipeline_execution_logs` | One row per layer run — Bronze, Silver and Gold. |
+| Serving | Power BI | Report on the Gold tables; file in `Phase3/`. |
 
 ## 2. Notebooks
 
@@ -29,7 +41,8 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | `01-setup` | Creates the `pakistan_weather` database and the `pipeline_execution_logs` table. |
 | `02-bronzelayer` | Raw JSON → Bronze. Reads with an explicit `StructType` (no `inferSchema`). |
 | `03-silverlayer` | Bronze → Silver. Explodes hourly arrays, casts types, quarantines bad rows, `MERGE INTO`. |
-| `04-incrementalload` | Fetches one day or a date range from the API, saves the raw file, then runs `02` and `03`. |
+| `04-incrementalload` | Fetches one day or a date range from the API, saves the raw file, then runs `02`, `03` and `05`. |
+| `05-goldlayer` | Silver → Gold. Builds `dim_location`, `dim_date`, `fact_weather_hourly` (`MERGE`, clustered), both aggregates, validation checks and the audit row. |
 
 ## 3. Data Dictionary
 
@@ -101,7 +114,7 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | Column | Type | Description |
 |---|---|---|
 | `log_id` | BIGINT | Identity key |
-| `layer` | STRING | `Raw-to-Bronze` or `Bronze-to-Silver` |
+| `layer` | STRING | `Raw-to-Bronze`, `Bronze-to-Silver` or `Silver-to-Gold` |
 | `load_type` | STRING | `full` or `incremental` |
 | `file_processed` | STRING | Raw file path (Bronze) or source table (Silver) |
 | `city` | STRING | `All-5-Cities` |
@@ -109,9 +122,79 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | `end_time` | TIMESTAMP | Run end |
 | `status` | STRING | `Success` or `Failure` |
 | `rows_inserted` | BIGINT | Rows inserted (Bronze: rows written; Silver: `MERGE` inserts) |
-| `rows_updated` | BIGINT | Rows updated (Silver `MERGE` updates) |
+| `rows_updated` | BIGINT | Rows updated (Silver/Gold `MERGE` updates) |
+| `rows_aggregated` | BIGINT | Rows read from Silver by the Gold run |
 | `error_message` | STRING | Error text on failure, otherwise NULL |
 | `batch_id` | STRING | Batch identifier |
+
+### 3.5 Gold Dimensions — `dim_location`, `dim_date`
+
+**`dim_location`** (5 rows). **Primary key:** `location_key`.
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | Surrogate key, 1–5 |
+| `city` | STRING | Lahore, Karachi, Islamabad, Peshawar, Quetta |
+| `province` | STRING | Province / territory |
+| `grid_latitude`, `grid_longitude` | DOUBLE | API grid point (joins back to Silver lat/long) |
+| `city_latitude`, `city_longitude` | DOUBLE | City centre coordinates |
+
+**`dim_date`** (one row per day, 2000-01-01 → latest year in Silver). **Primary key:** `date_key`.
+
+| Column | Type | Description |
+|---|---|---|
+| `date_key` | INT | Smart key `YYYYMMDD` |
+| `full_date` | DATE | Calendar date |
+| `year`, `quarter`, `month`, `day`, `day_of_week` | INT | Calendar hierarchy |
+| `month_name`, `day_name` | STRING | Human-readable names |
+| `is_weekend` | BOOLEAN | Saturday/Sunday |
+| `season` | STRING | Spring / Summer / Autumn / Winter |
+| `is_monsoon` | BOOLEAN | July–September |
+
+### 3.6 Gold Fact — `fact_weather_hourly`
+
+**Grain:** one row per city per hour. **Primary key:** `(location_key, observation_timestamp)` — this is the `MERGE INTO` key. **Clustering:** `CLUSTER BY (location_key, date_key)`.
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | PK, FK → `dim_location` |
+| `observation_timestamp` | TIMESTAMP | PK; hour of observation |
+| `date_key` | INT | FK → `dim_date` |
+| `hour` | INT | 0–23 |
+| `time_of_day` | STRING | Derived: Morning / Afternoon / Evening / Night |
+| `heat_index` | DOUBLE | Derived: heat-index approximation for temps ≥ 27 °C, else equals `temperature_2m` |
+| `gold_load_timestamp` | TIMESTAMP | When the row was written to Gold |
+| `batch_id` | STRING | Batch identifier |
+
+**Measures:** `temperature_2m`, `apparent_temperature`, `relative_humidity_2m`, `precipitation`, `rain`, `wind_speed_10m`, `wind_gusts_10m`, `pressure_msl`, `cloud_cover`, `shortwave_radiation`, `et0_fao_evapotranspiration`.
+
+### 3.7 Gold Aggregates — `agg_monthly_climate`, `agg_yearly_extremes`
+
+**`agg_monthly_climate`** — logical key `(location_key, year, month)`; `date_key` points to the month-start date (`YYYYMM01`) in `dim_date` (shared dimension at coarser grain).
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | FK → `dim_location` |
+| `year`, `month`, `month_name` | INT, STRING | Grain |
+| `date_key` | INT | FK → month-start `dim_date.date_key` |
+| `avg_temp_c`, `min_temp_c`, `max_temp_c` | DOUBLE | Monthly temperature stats (°C) |
+| `total_precip_mm` | DOUBLE | Monthly total precipitation (mm) |
+| `avg_wind_speed_kmh` | DOUBLE | Monthly mean wind speed |
+| `hours_observed` | BIGINT | Hourly rows behind the aggregate (~744) |
+| `gold_load_timestamp`, `batch_id` | TIMESTAMP, STRING | Audit / lineage |
+
+**`agg_yearly_extremes`** — logical key `(location_key, year)`; `date_key` points to the year-start date (`YYYY0101`).
+
+| Column | Type | Description |
+|---|---|---|
+| `location_key` | BIGINT | FK → `dim_location` |
+| `year` | INT | Grain |
+| `date_key` | INT | FK → year-start `dim_date.date_key` |
+| `hottest_temp_c` | DOUBLE | Hottest daily max (°C) |
+| `coldest_temp_c` | DOUBLE | Coldest daily min (°C) |
+| `wettest_day_precip_mm` | DOUBLE | Highest single-day rainfall (mm) |
+| `highest_wind_speed_kmh` | DOUBLE | Strongest daily peak wind |
+| `gold_load_timestamp`, `batch_id` | TIMESTAMP, STRING | Audit / lineage |
 
 ## 4. Engineering Design
 
@@ -132,7 +215,17 @@ Open-Meteo API ──► Raw JSON (Volumes) ──► Bronze (raw, all strings) 
 | Value cannot be cast to the expected type | Absorbed (all strings) | Row sent to `silver_quarantine` with its raw values; remaining rows load normally |
 | Column missing in a batch | NULL in Bronze | Filled with NULL so the `MERGE` still succeeds |
 
-**Audit logging.** Every run of `02` and `03`, full or incremental, writes a row to `pipeline_execution_logs` with layer, file/table processed, start and end time, status and row counts. Failures are logged first and then re-raised, so a failed Bronze run stops `04` before Silver runs.
+**Audit logging.** Every run of `02` and `03`, full or incremental, writes a row to `pipeline_execution_logs` with layer, file/table processed, start and end time, status and row counts. Failures are logged first and then re-raised, so a failed Bronze run stops `04` before Silver runs. The Gold run (`05`) writes the `Silver-to-Gold` row with `rows_aggregated`.
+
+**Star schema & broadcast joins.** The fact joins Silver's grid coordinates to the nearest city (squared-distance window in `dim_location`), then both dimensions are broadcast-joined — they are tiny (5 and ~9.8 K rows), so the 1.17 M-row fact is never shuffled.
+
+**Liquid clustering.** `fact_weather_hourly` uses `CLUSTER BY (location_key, date_key)` because every analytical query filters by city and date. Unlike Hive-style partitioning it adapts as data grows and avoids small-file and over-partitioning problems.
+
+**Gold idempotency & cost control.** The fact is loaded with `MERGE INTO` on `(location_key, observation_timestamp)` — re-running a batch updates in place, never duplicates. Dimensions and aggregates are rebuilt with `overwrite`, safe because they are fully derived from the fact. `OPTIMIZE` runs only on full loads so daily incremental runs skip compaction (FinOps).
+
+**Derived measures.** `time_of_day` buckets and the `heat_index` formula (applied at ≥ 27 °C) are computed once in Gold, so every consumer gets identical definitions.
+
+**Gold validation.** After every Gold run: row counts per table, exactly 5 locations, zero duplicate fact keys and zero orphan `location_key` / `date_key` values — enforced with assertions that fail the run on violation.
 
 ## 5. Execution Guide
 
@@ -180,20 +273,36 @@ FROM pakistan_weather.pipeline_execution_logs ORDER BY log_id DESC;
 
 The Silver row count must be identical after the second run; the second log row shows rows updated instead of inserted.
 
+### 5.5 Gold after a full load
+
+Run `05-goldlayer` with widgets `load_type` = `full`, `batch_id` = `batch_fullload_2000_2026`. Rebuilds the dimensions and aggregates and merges the full history into the fact.
+
+### 5.6 Gold on the daily incremental
+
+No extra step: `04-incrementalload` sets `LOAD_TYPE = "incremental"` and runs `05-goldlayer` automatically after Silver — only that day's batch is merged into the fact.
+
 ## 6. Repository Structure
 
 ```
-data/
-└── full_load/sample
-└── incremental_load/sample
+Phase3/
+├── Final Architecture & FinOps Report pakistan weather.pdf
+└── Pakistan_5cities_weather_pipeline_visualreport.pbix
 
-phase1/prposal.docx
+data/
+├── fetch_data.py
+├── Full_load/full_load_sample.json
+└── incremental_load/inc_load.json
+
+phase-1/ (proposal documents)
+
 phase2/
 └── notebooks/
-    ├── 00-dataaquisition_fullload.ipynb
+    ├── 00-dataacqusition_fullload.ipynb
     ├── 01-setup.ipynb
     ├── 02-bronzelayer.ipynb
     ├── 03-silverlayer.ipynb
-    └── 04-incrementalload.ipynb
+    ├── 04-incrementalload.ipynb
+    └── 05-goldlayer.ipynb
+
 README.md
 ```
